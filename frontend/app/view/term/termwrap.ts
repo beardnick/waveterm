@@ -39,52 +39,6 @@ export const SupportsImageInput = true;
 
 const MarkdownExtensions = new Set(["md", "mdx", "markdown"]);
 const ImageExtensions = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tiff", "tif", "ico", "heic"]);
-const CodeExtensions = new Set([
-    "ts",
-    "tsx",
-    "js",
-    "jsx",
-    "mjs",
-    "cjs",
-    "json",
-    "css",
-    "scss",
-    "less",
-    "html",
-    "svelte",
-    "astro",
-    "vue",
-    "py",
-    "rb",
-    "rs",
-    "go",
-    "java",
-    "kt",
-    "swift",
-    "scala",
-    "c",
-    "cc",
-    "cpp",
-    "cxx",
-    "h",
-    "hpp",
-    "cs",
-    "php",
-    "sh",
-    "bash",
-    "zsh",
-    "fish",
-    "ps1",
-    "psm1",
-    "sql",
-    "toml",
-    "yaml",
-    "yml",
-    "ini",
-    "cfg",
-    "tex",
-    "rsx",
-]);
 
 type FileLinkCandidate = {
     displayText: string;
@@ -93,20 +47,6 @@ type FileLinkCandidate = {
     columnEnd: number;
     isDirectory: boolean;
 };
-
-const termWrapInstances = new Map<string, TermWrap>();
-
-function extractPathFromLine(text: string): string | null {
-    if (!text) {
-        return null;
-    }
-    const matches = text.match(/((?:~\/|\/)[^\s]+)/g);
-    if (matches && matches.length > 0) {
-        return matches[matches.length - 1];
-    }
-    return null;
-}
-
 function sanitizeDisplayedName(display: string): string {
     if (!display) {
         return display;
@@ -300,7 +240,7 @@ function resolvePathRelativeToCwd(rawName: string, cwd: string | null, homeDir: 
     return joinPosixPath(base, trimmed);
 }
 
-type FileCategory = "directory" | "markdown" | "image" | "code" | "other";
+type FileCategory = "directory" | "markdown" | "image" | "other";
 
 function inferFileCategory(name: string, isDirectory: boolean): FileCategory {
     if (isDirectory) {
@@ -320,9 +260,6 @@ function inferFileCategory(name: string, isDirectory: boolean): FileCategory {
     }
     if (ImageExtensions.has(ext)) {
         return "image";
-    }
-    if (CodeExtensions.has(ext)) {
-        return "code";
     }
     return "other";
 }
@@ -452,11 +389,6 @@ function handleOsc7Command(data: string, blockId: string, loaded: boolean): bool
     } catch (e) {
         console.log("Invalid OSC 7 command received (parse error)", data, e);
         return true;
-    }
-
-    const termWrapInstance = termWrapInstances.get(blockId);
-    if (termWrapInstance) {
-        termWrapInstance.lastKnownCwd = pathPart;
     }
 
     setTimeout(() => {
@@ -680,7 +612,6 @@ export class TermWrap {
     // xterm.js paste() method triggers onData event, which can cause duplicate sends
     lastPasteData: string = "";
     lastPasteTime: number = 0;
-    lastKnownCwd: string | null = null;
 
     constructor(
         blockId: string,
@@ -698,7 +629,6 @@ export class TermWrap {
         this.promptMarkers = [];
         this.shellIntegrationStatusAtom = jotai.atom(null) as jotai.PrimitiveAtom<"ready" | "running-command" | null>;
         this.lastCommandAtom = jotai.atom(null) as jotai.PrimitiveAtom<string | null>;
-        termWrapInstances.set(blockId, this);
         this.terminal = new Terminal(options);
         this.fitAddon = new FitAddon();
         this.fitAddon.noScrollbar = PLATFORM === PlatformMacOS;
@@ -819,19 +749,13 @@ export class TermWrap {
         const blockAtom = WOS.getWaveObjectAtom(WOS.makeORef("block", this.blockId));
         const blockData = globalStore.get(blockAtom);
         const connection = blockData?.meta?.connection ?? null;
-        const metaCwd = blockData?.meta?.["cmd:cwd"] ?? null;
         const isLocalConnection = connection == null || connection === "" || connection === "local";
         const homeDir = isLocalConnection ? getApi().getHomeDir() : null;
-        let cwd = metaCwd ?? this.lastKnownCwd;
+        const metaCwd = blockData?.meta?.["cmd:cwd"] ?? null;
+        const cwd = metaCwd;
         if (!cwd) {
-            const promptPath = this.getPromptDirectory();
-            if (promptPath) {
-                cwd = promptPath;
-                this.lastKnownCwd = promptPath;
-            }
-        }
-        if (!cwd) {
-            cwd = isLocalConnection ? "~" : null;
+            console.warn("Cannot resolve path without OSC 7 cwd for block", this.blockId);
+            return;
         }
         const resolvedPath = resolvePathRelativeToCwd(candidate.canonicalName, cwd, homeDir);
         if (!resolvedPath) {
@@ -841,7 +765,10 @@ export class TermWrap {
 
         const category = inferFileCategory(candidate.canonicalName, candidate.isDirectory);
 
-        if (category === "code" && isLocalConnection) {
+        const shouldOpenInPreview =
+            category === "directory" || category === "markdown" || category === "image" || !isLocalConnection;
+
+        if (!shouldOpenInPreview) {
             try {
                 getApi().openWithCursor(resolvedPath);
             } catch (err) {
@@ -978,27 +905,6 @@ export class TermWrap {
             } catch (_) {}
         });
         this.mainFileSubject.release();
-        termWrapInstances.delete(this.blockId);
-    }
-
-    private getPromptDirectory(): string | null {
-        const buffer = this.terminal?.buffer?.active;
-        if (!buffer) {
-            return null;
-        }
-        const cursorLine = buffer.baseY + buffer.cursorY;
-        for (let offset = 0; offset < 3; offset++) {
-            const line = buffer.getLine(cursorLine - offset);
-            if (!line) {
-                continue;
-            }
-            const text = line.translateToString(true);
-            const extracted = extractPathFromLine(text);
-            if (extracted) {
-                return extracted;
-            }
-        }
-        return null;
     }
 
     handleTermData(data: string) {

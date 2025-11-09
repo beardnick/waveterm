@@ -12,16 +12,23 @@ import { RpcApi } from "../frontend/app/store/wshclientapi";
 import { getWebServerEndpoint } from "../frontend/util/endpoints";
 import * as keyutil from "../frontend/util/keyutil";
 import { fireAndForget, parseDataUrl } from "../frontend/util/util";
+import { incrementTermCommandsRun } from "./emain-activity";
 import { createBuilderWindow, getBuilderWindowByWebContentsId } from "./emain-builder";
-import { callWithOriginalXdgCurrentDesktop, callWithOriginalXdgCurrentDesktopAsync, unamePlatform } from "./emain-platform";
+import {
+    callWithOriginalXdgCurrentDesktop,
+    callWithOriginalXdgCurrentDesktopAsync,
+    unamePlatform,
+} from "./emain-platform";
 import { getWaveTabViewByWebContentsId } from "./emain-tabview";
 import { handleCtrlShiftState } from "./emain-util";
 import { getWaveVersion } from "./emain-wavesrv";
 import { createNewWaveWindow, focusedWaveWindow, getWaveWindowByWebContentsId } from "./emain-window";
-import { incrementTermCommandsRun } from "./emain-activity";
 import { ElectronWshClient } from "./emain-wsh";
 
 const electronApp = electron.app;
+
+let webviewFocusId: number = null;
+let webviewKeys: string[] = [];
 
 function expandHomePath(filePath: string): string {
     if (typeof filePath !== "string" || filePath.length === 0) {
@@ -94,9 +101,6 @@ function openFileWithCursor(filePath: string) {
         fallbackOpen();
     }
 }
-
-let webviewFocusId: number = null;
-let webviewKeys: string[] = [];
 
 type UrlInSessionResult = {
     stream: Readable;
