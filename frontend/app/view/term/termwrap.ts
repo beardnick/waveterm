@@ -344,6 +344,16 @@ export class TermWrap {
     handleResize_debounced: () => void;
     hasResized: boolean;
     multiInputCallback: (data: string) => void;
+    /**
+     * Allows callers to intercept user input before it is dispatched to the controller.
+     * When the interceptor returns true, the input will be considered handled and not forwarded.
+     */
+    inputInterceptionCallback?: (data: string) => boolean;
+    /**
+     * Callback that fires right before data is sent to the controller (after interception).
+     * Useful for tracking user input state.
+     */
+    beforeSendInputCallback?: (data: string) => void;
     sendDataHandler: (data: string) => void;
     onSearchResultsDidChange?: (result: { resultIndex: number; resultCount: number }) => void;
     private toDispose: TermTypes.IDisposable[] = [];
@@ -576,11 +586,24 @@ export class TermWrap {
             return;
         }
 
+        if (this.inputInterceptionCallback) {
+            try {
+                const handled = this.inputInterceptionCallback(data);
+                if (handled) {
+                    return;
+                }
+            } catch (err) {
+                console.error("Error in input interception callback:", err);
+            }
+        }
+
         if (this.pasteActive) {
             if (this.multiInputCallback) {
                 this.multiInputCallback(data);
             }
         }
+
+        this.beforeSendInputCallback?.(data);
 
         // IME Deduplication (for Capslock input method switching)
         // When switching input methods with Capslock during composition, some systems send the
@@ -613,6 +636,69 @@ export class TermWrap {
 
     addFocusListener(focusFn: () => void) {
         this.terminal.textarea.addEventListener("focus", focusFn);
+    }
+
+    getCursorOverlayMetrics(): {
+        left: number;
+        top: number;
+        cellWidth: number;
+        cellHeight: number;
+        cols: number;
+        fontFamily?: string;
+        fontSize?: number;
+        contentLeft: number;
+    } | null {
+        const core = (this.terminal as any)?._core;
+        const renderService = core?._renderService;
+        const dims = renderService?.dimensions;
+        const buffer = this.terminal.buffer?.active;
+
+        if (!dims || !buffer) {
+            return null;
+        }
+
+        const containerRect = this.connectElem.getBoundingClientRect();
+        const screenElement = this.connectElem.querySelector(".xterm-screen") as HTMLElement;
+        const viewportElement = this.connectElem.querySelector(".xterm-viewport") as HTMLElement;
+        const screenRect = screenElement?.getBoundingClientRect();
+        const viewportRect = viewportElement?.getBoundingClientRect();
+
+        const contentOffsetLeft = screenRect
+            ? screenRect.left - containerRect.left
+            : viewportRect
+              ? viewportRect.left - containerRect.left
+              : 0;
+        const contentOffsetTop = screenRect
+            ? screenRect.top - containerRect.top
+            : viewportRect
+              ? viewportRect.top - containerRect.top
+              : 0;
+
+        const cursorX = buffer.cursorX ?? 0;
+        const cursorY = buffer.cursorY ?? 0;
+        const baseY = buffer.baseY ?? 0;
+        const ydisp = (buffer as any).ydisp ?? 0;
+        const absoluteRow = baseY + cursorY;
+        const relativeRow = Math.max(0, absoluteRow - ydisp);
+
+        const cellWidth = dims.actualCellWidth ?? 9;
+        const cellHeight = dims.actualCellHeight ?? 16;
+        const left = contentOffsetLeft + cursorX * cellWidth;
+        const top = contentOffsetTop + relativeRow * cellHeight;
+
+        const fontFamily = this.terminal.options?.fontFamily;
+        const fontSize = this.terminal.options?.fontSize;
+
+        return {
+            left,
+            top,
+            cellWidth,
+            cellHeight,
+            cols: this.terminal.cols ?? 80,
+            fontFamily,
+            fontSize,
+            contentLeft: contentOffsetLeft,
+        };
     }
 
     handleNewFileSubjectData(msg: WSFileEventData) {

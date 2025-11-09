@@ -33,11 +33,18 @@ import { getBlockingCommand } from "./shellblocking";
 import { computeTheme, DefaultTermTheme } from "./termutil";
 import { TermWrap } from "./termwrap";
 
+type TermInputOverlayHandlers = {
+    openOverlay: (initialValue: string) => void;
+};
+
 export class TermViewModel implements ViewModel {
     viewType: string;
     nodeModel: BlockNodeModel;
     connected: boolean;
     termRef: React.RefObject<TermWrap> = { current: null };
+    private currentInputBuffer: string = "";
+    private inputOverlayHandlers: TermInputOverlayHandlers | null = null;
+    private overlayActive: boolean = false;
     blockAtom: jotai.Atom<Block>;
     termMode: jotai.Atom<string>;
     blockId: string;
@@ -386,6 +393,100 @@ export class TermViewModel implements ViewModel {
         }
     }
 
+    registerInputOverlayHandlers(handlers: TermInputOverlayHandlers | null) {
+        this.inputOverlayHandlers = handlers;
+    }
+
+    getCurrentBufferedInput(): string {
+        return this.currentInputBuffer ?? "";
+    }
+
+    requestStartInputOverlay(): boolean {
+        if (this.overlayActive) {
+            return false;
+        }
+        if (!this.inputOverlayHandlers?.openOverlay) {
+            return false;
+        }
+        const initialValue = this.getCurrentBufferedInput();
+        this.inputOverlayHandlers.openOverlay(initialValue);
+        return true;
+    }
+
+    setOverlayActive(active: boolean) {
+        this.overlayActive = active;
+        if (!active) {
+            this.resetCurrentInputBuffer();
+        }
+    }
+
+    isOverlayActive(): boolean {
+        return this.overlayActive;
+    }
+
+    setCurrentInputBuffer(value: string) {
+        this.currentInputBuffer = value ?? "";
+    }
+
+    resetCurrentInputBuffer() {
+        this.currentInputBuffer = "";
+    }
+
+    recordUserInput(data: string) {
+        if (data == null) {
+            return;
+        }
+        if (this.overlayActive) {
+            return;
+        }
+        for (const ch of data) {
+            if (ch === "\r" || ch === "\n") {
+                this.currentInputBuffer = "";
+            } else if (ch === "\b" || ch === "\x7f") {
+                if (this.currentInputBuffer.length > 0) {
+                    this.currentInputBuffer = this.currentInputBuffer.slice(0, this.currentInputBuffer.length - 1);
+                }
+            } else if (ch === "\x1b") {
+                // Escape sequences usually indicate navigation or control changes.
+                this.currentInputBuffer = "";
+            } else if (ch >= " " || ch === "\t") {
+                this.currentInputBuffer += ch;
+            }
+        }
+    }
+
+    sendBackspaces(count: number) {
+        if (!count || count <= 0) {
+            return;
+        }
+        const backspaces = "\x7f".repeat(count);
+        this.sendDataToController(backspaces);
+    }
+
+    submitOverlayInput(text: string) {
+        const value = text ?? "";
+        let normalized = value.replace(/\r\n/g, "\r").replace(/\n/g, "\r");
+        if (!normalized.endsWith("\r")) {
+            normalized += "\r";
+        }
+        if (normalized.length === 0) {
+            normalized = "\r";
+        }
+        this.sendDataToController(normalized);
+        this.resetCurrentInputBuffer();
+    }
+
+    sendOverlayTextWithoutSubmit(text: string) {
+        const value = text ?? "";
+        if (value.length === 0) {
+            this.setCurrentInputBuffer("");
+            return;
+        }
+        const normalized = value.replace(/\r\n/g, "\r").replace(/\n/g, "\r");
+        this.sendDataToController(normalized);
+        this.setCurrentInputBuffer(value);
+    }
+
     sendDataToController(data: string) {
         const b64data = stringToBase64(data);
         RpcApi.ControllerInputCommand(TabRpcClient, { blockid: this.blockId, inputdata64: b64data });
@@ -502,6 +603,14 @@ export class TermViewModel implements ViewModel {
             event.preventDefault();
             event.stopPropagation();
             return false;
+        }
+        if (keyutil.checkKeyPressed(waveEvent, "Ctrl:Enter")) {
+            const started = this.requestStartInputOverlay();
+            if (started) {
+                event.preventDefault();
+                event.stopPropagation();
+                return false;
+            }
         }
         if (keyutil.checkKeyPressed(waveEvent, "Shift:Enter")) {
             const shiftEnterNewlineAtom = getOverrideConfigAtom(this.blockId, "term:shiftenternewline");

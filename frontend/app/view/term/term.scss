@@ -61,6 +61,22 @@
         line-height: 1;
         margin: 5px;
         margin-left: 4px;
+        position: relative;
+
+        .term-input-overlay {
+            position: absolute;
+            z-index: calc(var(--zindex-termstickers) + 5);
+            background-color: var(--term-background);
+            color: var(--term-foreground);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 4px;
+            padding: 4px 6px;
+            resize: none;
+            outline: none;
+            box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.05);
+            white-space: pre-wrap;
+            overflow-y: auto;
+        }
     }
 
     .term-htmlelem {

@@ -33,6 +33,14 @@ interface TerminalViewProps {
     model: TermViewModel;
 }
 
+type TermInputOverlayState = {
+    active: boolean;
+    value: string;
+    position: { top: number; left: number; contentLeft: number };
+    cell: { width: number; height: number; cols: number };
+    font: { family?: string; size?: number };
+};
+
 const TermResyncHandler = React.memo(({ blockId, model }: TerminalViewProps) => {
     const connStatus = jotai.useAtomValue(model.connStatus);
     const [lastConnStatus, setLastConnStatus] = React.useState<ConnStatus>(connStatus);
@@ -163,6 +171,7 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
     const [blockData] = WOS.useWaveObjectValue<Block>(WOS.makeORef("block", blockId));
     const termSettingsAtom = getSettingsPrefixAtom("term");
     const termSettings = jotai.useAtomValue(termSettingsAtom);
+    const termFontFamilySetting = termSettings?.["term:fontfamily"];
     let termMode = blockData?.meta?.["term:mode"] ?? "term";
     if (termMode != "term" && termMode != "vdom") {
         termMode = "term";
@@ -175,6 +184,277 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
     const isFocused = jotai.useAtomValue(model.nodeModel.isFocused);
     const isMI = jotai.useAtomValue(atoms.isTermMultiInput);
     const isBasicTerm = termMode != "vdom" && blockData?.meta?.controller != "cmd"; // needs to match isBasicTerm
+
+    const [overlayState, setOverlayState] = React.useState<TermInputOverlayState>({
+        active: false,
+        value: "",
+        position: { top: 0, left: 0, contentLeft: 0 },
+        cell: { width: 9, height: 16, cols: 120 },
+        font: { family: termFontFamilySetting ?? connFontFamily, size: termFontSize },
+    });
+    const overlayTextareaRef = React.useRef<HTMLTextAreaElement>(null);
+    const overlayStateRef = React.useRef<TermInputOverlayState>(overlayState);
+    const overlayOriginalInputRef = React.useRef<string>("");
+
+    React.useEffect(() => {
+        overlayStateRef.current = overlayState;
+    }, [overlayState]);
+
+    const handleBeforeSendInput = React.useCallback(
+        (data: string) => {
+            model.recordUserInput(data);
+        },
+        [model]
+    );
+
+    const handleInterceptInput = React.useCallback(
+        (data: string) => {
+            if (!overlayStateRef.current.active) {
+                return false;
+            }
+            if (data && data.length > 0) {
+                setOverlayState((prev) => {
+                    if (!prev.active) {
+                        return prev;
+                    }
+                    return { ...prev, value: prev.value + data };
+                });
+            }
+            return true;
+        },
+        []
+    );
+
+    const updateOverlayPosition = React.useCallback(() => {
+        const termWrap = model.termRef.current;
+        if (!termWrap || !overlayStateRef.current.active) {
+            return;
+        }
+        const metrics = termWrap.getCursorOverlayMetrics();
+        if (!metrics) {
+            return;
+        }
+        setOverlayState((prev) => {
+            if (!prev.active) {
+                return prev;
+            }
+            return {
+                ...prev,
+                position: {
+                    top: metrics.top ?? prev.position.top,
+                    left: metrics.left ?? prev.position.left,
+                    contentLeft: metrics.contentLeft ?? prev.position.contentLeft ?? 0,
+                },
+                cell: {
+                    width: metrics.cellWidth || prev.cell.width,
+                    height: metrics.cellHeight || prev.cell.height,
+                    cols: metrics.cols || prev.cell.cols,
+                },
+                font: {
+                    family: metrics.fontFamily ?? prev.font.family,
+                    size: metrics.fontSize ?? prev.font.size,
+                },
+            };
+        });
+    }, [model]);
+
+    const openOverlay = React.useCallback(
+        (initialValue: string) => {
+            const termWrap = model.termRef.current;
+            if (!termWrap) {
+                return;
+            }
+            const existingValue = initialValue ?? "";
+            model.setOverlayActive(true);
+            model.setCurrentInputBuffer(existingValue);
+            overlayOriginalInputRef.current = existingValue;
+            const charArray = Array.from(existingValue);
+            if (charArray.length > 0) {
+                model.sendBackspaces(charArray.length);
+            }
+            const metrics = termWrap.getCursorOverlayMetrics();
+            const fallback = overlayStateRef.current;
+            const cellWidth = metrics?.cellWidth || fallback.cell.width;
+            const cellHeight = metrics?.cellHeight || fallback.cell.height;
+            const cols = metrics?.cols || termWrap.terminal?.cols || fallback.cell.cols;
+            const left = metrics?.left ?? fallback.position.left;
+            const top = metrics?.top ?? fallback.position.top;
+            const contentLeft = metrics?.contentLeft ?? fallback.position.contentLeft ?? 0;
+            const fontFamily = metrics?.fontFamily ?? termFontFamilySetting ?? connFontFamily ?? fallback.font.family;
+            const fontSize = metrics?.fontSize ?? termFontSize ?? fallback.font.size;
+            setOverlayState({
+                active: true,
+                value: existingValue,
+                position: { top, left, contentLeft },
+                cell: { width: cellWidth, height: cellHeight, cols },
+                font: { family: fontFamily, size: fontSize },
+            });
+            requestAnimationFrame(() => {
+                if (overlayTextareaRef.current) {
+                    overlayTextareaRef.current.focus();
+                    const length = existingValue.length;
+                    overlayTextareaRef.current.setSelectionRange(length, length);
+                }
+            });
+            termWrap.terminal.blur?.();
+            requestAnimationFrame(() => updateOverlayPosition());
+        },
+        [model, termFontFamilySetting, connFontFamily, termFontSize, updateOverlayPosition]
+    );
+
+    const closeOverlay = React.useCallback(
+        (action: "submit" | "cancel") => {
+            const latestValue = overlayStateRef.current.value ?? "";
+            const originalValue = overlayOriginalInputRef.current;
+            overlayOriginalInputRef.current = "";
+            setOverlayState((prev) => ({
+                ...prev,
+                active: false,
+                value: "",
+            }));
+            model.setOverlayActive(false);
+            if (action === "submit") {
+                model.submitOverlayInput(latestValue);
+            } else if (action === "cancel" && originalValue) {
+                model.sendOverlayTextWithoutSubmit(originalValue);
+            }
+            requestAnimationFrame(() => {
+                model.termRef.current?.terminal.focus();
+            });
+        },
+        [model]
+    );
+
+    const handleOverlayChange = React.useCallback(
+        (event: React.ChangeEvent<HTMLTextAreaElement>) => {
+            const value = event.target.value;
+            setOverlayState((prev) => ({ ...prev, value }));
+            model.setCurrentInputBuffer(value);
+        },
+        [model]
+    );
+
+    const insertOverlayTextAtCursor = React.useCallback(
+        (text: string) => {
+            const textarea = overlayTextareaRef.current;
+            if (!textarea) {
+                return;
+            }
+            const start = textarea.selectionStart ?? 0;
+            const end = textarea.selectionEnd ?? start;
+            const currentValue = textarea.value ?? "";
+            const newValue = currentValue.slice(0, start) + text + currentValue.slice(end);
+            const caret = start + text.length;
+            setOverlayState((prev) => ({ ...prev, value: newValue }));
+            model.setCurrentInputBuffer(newValue);
+            requestAnimationFrame(() => {
+                if (overlayTextareaRef.current) {
+                    overlayTextareaRef.current.setSelectionRange(caret, caret);
+                }
+            });
+        },
+        [model]
+    );
+
+    const handleOverlayKeyDown = React.useCallback(
+        (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+            if (event.key === "Enter" && event.ctrlKey && !event.altKey && !event.metaKey) {
+                event.preventDefault();
+                insertOverlayTextAtCursor("\n");
+                return;
+            }
+            if (event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
+                event.preventDefault();
+                closeOverlay("submit");
+            } else if (event.key === "Escape") {
+                event.preventDefault();
+                closeOverlay("cancel");
+            }
+        },
+        [closeOverlay, insertOverlayTextAtCursor]
+    );
+
+    React.useEffect(() => {
+        model.registerInputOverlayHandlers({ openOverlay });
+        return () => {
+            model.registerInputOverlayHandlers(null);
+        };
+    }, [model, openOverlay]);
+
+    React.useEffect(() => {
+        if (!overlayState.active) {
+            return;
+        }
+        updateOverlayPosition();
+        const termWrap = model.termRef.current;
+        if (!termWrap) {
+            return;
+        }
+        const scrollDisposable = termWrap.terminal.onScroll(updateOverlayPosition);
+        const renderDisposable = termWrap.terminal.onRender(updateOverlayPosition);
+        const resizeDisposable = termWrap.terminal.onResize(updateOverlayPosition);
+        const handleWindowResize = () => updateOverlayPosition();
+        window.addEventListener("resize", handleWindowResize);
+        return () => {
+            window.removeEventListener("resize", handleWindowResize);
+            try {
+                scrollDisposable?.dispose();
+            } catch (_) {}
+            try {
+                renderDisposable?.dispose();
+            } catch (_) {}
+            try {
+                resizeDisposable?.dispose();
+            } catch (_) {}
+        };
+    }, [model, overlayState.active, updateOverlayPosition]);
+
+    let overlayStyle: React.CSSProperties | undefined;
+    if (overlayState.active) {
+        const terminal = model.termRef.current?.terminal;
+        const effectiveCols = Math.max(terminal?.cols ?? overlayState.cell.cols ?? 80, 1);
+        const effectiveRows = Math.max(terminal?.rows ?? 24, 1);
+        const cellWidth = overlayState.cell.width || 9;
+        const cellHeight = overlayState.cell.height || 16;
+        const lines = overlayState.value.split(/\r?\n/);
+        const lineCount = Math.max(lines.length, 1);
+        const longestLine = lines.reduce((max, line) => Math.max(max, line.length), 0);
+        const basePaddingX = 6;
+        const basePaddingY = 4;
+        const container = connectElemRef.current;
+        const containerRect = container?.getBoundingClientRect();
+        const containerWidth = containerRect?.width ?? cellWidth * effectiveCols;
+        const containerHeight = containerRect?.height ?? cellHeight * effectiveRows;
+        const maxWidthPx = containerWidth;
+        const desiredWidthPx = containerWidth;
+        const minWidthPx = containerWidth;
+        const widthPx = Math.min(Math.max(desiredWidthPx, minWidthPx), maxWidthPx);
+        const paddingAdjustment = 12;
+        const minHeightPx = cellHeight + paddingAdjustment;
+        const maxHeightPx = containerHeight;
+        const baseHeightPx = lineCount * cellHeight + paddingAdjustment;
+        const heightPx = Math.min(Math.max(baseHeightPx, minHeightPx), maxHeightPx);
+        let top = overlayState.position.top ?? 0;
+        if (top + heightPx > containerHeight) {
+            top = Math.max(0, containerHeight - heightPx);
+        }
+        overlayStyle = {
+            top,
+            left: 0,
+            width: widthPx,
+            height: heightPx,
+            minHeight: minHeightPx,
+            lineHeight: `${cellHeight}px`,
+            fontFamily: overlayState.font.family ?? termFontFamilySetting ?? connFontFamily ?? "Hack",
+            fontSize: overlayState.font.size ?? termFontSize,
+            maxHeight: maxHeightPx,
+            maxWidth: maxWidthPx,
+            paddingTop: basePaddingY,
+            paddingBottom: basePaddingY,
+            paddingRight: basePaddingX,
+            paddingLeft: (overlayState.position.contentLeft ?? 0) + basePaddingX,
+        };
+    }
 
     // search
     const searchProps = useSearch({
@@ -290,6 +570,8 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
         );
         (window as any).term = termWrap;
         model.termRef.current = termWrap;
+        termWrap.beforeSendInputCallback = handleBeforeSendInput;
+        termWrap.inputInterceptionCallback = handleInterceptInput;
         const rszObs = new ResizeObserver(() => {
             termWrap.handleResize_debounced();
         });
@@ -305,10 +587,12 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
             }, 10);
         }
         return () => {
+            termWrap.beforeSendInputCallback = undefined;
+            termWrap.inputInterceptionCallback = undefined;
             termWrap.dispose();
             rszObs.disconnect();
         };
-    }, [blockId, termSettings, termFontSize, connFontFamily]);
+    }, [blockId, termSettings, termFontSize, connFontFamily, handleBeforeSendInput, handleInterceptInput]);
 
     React.useEffect(() => {
         if (termModeRef.current == "vdom" && termMode == "term") {
@@ -367,6 +651,17 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
                     className="term-scrollbar-hide-observer"
                     onPointerOver={onScrollbarHideObserver}
                 />
+                {overlayState.active && overlayStyle && (
+                    <textarea
+                        ref={overlayTextareaRef}
+                        className="term-input-overlay"
+                        value={overlayState.value}
+                        onChange={handleOverlayChange}
+                        onKeyDown={handleOverlayKeyDown}
+                        spellCheck={false}
+                        style={overlayStyle}
+                    />
+                )}
             </div>
             <Search {...searchProps} />
         </div>
