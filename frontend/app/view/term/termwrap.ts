@@ -5,7 +5,16 @@ import { getFileSubject } from "@/app/store/wps";
 import { sendWSCommand } from "@/app/store/ws";
 import { RpcApi } from "@/app/store/wshclientapi";
 import { TabRpcClient } from "@/app/store/wshrpcutil";
-import { WOS, atoms, fetchWaveFile, getApi, getSettingsKeyAtom, globalStore, openLink } from "@/store/global";
+import {
+    WOS,
+    atoms,
+    createBlock,
+    fetchWaveFile,
+    getApi,
+    getSettingsKeyAtom,
+    globalStore,
+    openLink,
+} from "@/store/global";
 import * as services from "@/store/services";
 import { PLATFORM, PlatformMacOS } from "@/util/platformutil";
 import { base64ToArray, base64ToString, fireAndForget } from "@/util/util";
@@ -27,6 +36,296 @@ const TermFileName = "term";
 const TermCacheFileName = "cache:term:full";
 const MinDataProcessedForCache = 100 * 1024;
 export const SupportsImageInput = true;
+
+const MarkdownExtensions = new Set(["md", "mdx", "markdown"]);
+const ImageExtensions = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tiff", "tif", "ico", "heic"]);
+const CodeExtensions = new Set([
+    "ts",
+    "tsx",
+    "js",
+    "jsx",
+    "mjs",
+    "cjs",
+    "json",
+    "css",
+    "scss",
+    "less",
+    "html",
+    "svelte",
+    "astro",
+    "vue",
+    "py",
+    "rb",
+    "rs",
+    "go",
+    "java",
+    "kt",
+    "swift",
+    "scala",
+    "c",
+    "cc",
+    "cpp",
+    "cxx",
+    "h",
+    "hpp",
+    "cs",
+    "php",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ps1",
+    "psm1",
+    "sql",
+    "toml",
+    "yaml",
+    "yml",
+    "ini",
+    "cfg",
+    "tex",
+    "rsx",
+]);
+
+type FileLinkCandidate = {
+    displayText: string;
+    canonicalName: string;
+    columnStart: number;
+    columnEnd: number;
+    isDirectory: boolean;
+};
+
+const termWrapInstances = new Map<string, TermWrap>();
+
+function extractPathFromLine(text: string): string | null {
+    if (!text) {
+        return null;
+    }
+    const matches = text.match(/((?:~\/|\/)[^\s]+)/g);
+    if (matches && matches.length > 0) {
+        return matches[matches.length - 1];
+    }
+    return null;
+}
+
+function sanitizeDisplayedName(display: string): string {
+    if (!display) {
+        return display;
+    }
+    const trailingIndicators = new Set(["/", "*", "@", "=", "|"]);
+    let sanitized = display;
+    while (sanitized.length > 0 && trailingIndicators.has(sanitized[sanitized.length - 1])) {
+        sanitized = sanitized.slice(0, -1);
+    }
+    return sanitized.length > 0 ? sanitized : display;
+}
+
+function looksLikeLsLongFormatLine(line: string): boolean {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("total ")) {
+        return false;
+    }
+    const lsPattern = /^[\-ldcbps][rwxstST\-]{9}[@+\-]?\s+/;
+    return lsPattern.test(trimmed);
+}
+
+function extractFileCandidateFromLongListing(rawLine: string): FileLinkCandidate | null {
+    if (rawLine == null || rawLine.length === 0) {
+        return null;
+    }
+    const lineWithoutTrailingWhitespace = rawLine.replace(/\s+$/, "");
+    if (!looksLikeLsLongFormatLine(lineWithoutTrailingWhitespace)) {
+        return null;
+    }
+    let inspectLine = lineWithoutTrailingWhitespace;
+    const arrowIdx = inspectLine.indexOf(" -> ");
+    if (arrowIdx !== -1) {
+        inspectLine = inspectLine.slice(0, arrowIdx);
+    }
+    let idx = 0;
+    const len = inspectLine.length;
+    let fieldsConsumed = 0;
+    while (idx < len && fieldsConsumed < 8) {
+        while (idx < len && inspectLine[idx] === " ") {
+            idx++;
+        }
+        while (idx < len && inspectLine[idx] !== " ") {
+            idx++;
+        }
+        fieldsConsumed++;
+        while (idx < len && inspectLine[idx] === " ") {
+            idx++;
+        }
+    }
+    if (idx >= len) {
+        return null;
+    }
+    const displayText = inspectLine.slice(idx);
+    if (displayText.length === 0) {
+        return null;
+    }
+    const canonicalName = sanitizeDisplayedName(displayText);
+    if (!canonicalName) {
+        return null;
+    }
+    const trimmed = lineWithoutTrailingWhitespace.trimStart();
+    const isDirectory = trimmed.startsWith("d") || canonicalName.endsWith("/");
+    return {
+        displayText,
+        canonicalName,
+        columnStart: idx + 1,
+        columnEnd: idx + 1 + displayText.length,
+        isDirectory,
+    };
+}
+
+function isWindowsStylePath(pathStr: string): boolean {
+    return /^[a-zA-Z]:[\\/]/.test(pathStr) || pathStr.startsWith("\\\\");
+}
+
+function extractFileCandidatesFromLine(rawLine: string): FileLinkCandidate[] {
+    const candidates: FileLinkCandidate[] = [];
+    const longListingCandidate = extractFileCandidateFromLongListing(rawLine);
+    if (longListingCandidate) {
+        candidates.push(longListingCandidate);
+        return candidates;
+    }
+    if (rawLine == null || rawLine.trim().length === 0) {
+        return candidates;
+    }
+    const seen = new Set<string>();
+    const columnRegex = /(\S[\S ]*?)(?=\s{2,}|\s*$)/g;
+    let match: RegExpExecArray;
+    while ((match = columnRegex.exec(rawLine)) != null) {
+        const segment = match[1];
+        if (!segment) {
+            continue;
+        }
+        const leadingTrim = segment.length - segment.trimStart().length;
+        const trailingTrim = segment.length - segment.trimEnd().length;
+        const trimmedSegment = segment.trim();
+        if (trimmedSegment.length === 0) {
+            continue;
+        }
+        const startIdx = match.index + leadingTrim;
+        const endIdx = match.index + segment.length - trailingTrim;
+        const sanitized = sanitizeDisplayedName(trimmedSegment);
+        if (!sanitized) {
+            continue;
+        }
+        const dedupeKey = `${startIdx}:${sanitized}`;
+        if (seen.has(dedupeKey)) {
+            continue;
+        }
+        seen.add(dedupeKey);
+        const isDirectory = trimmedSegment.endsWith("/") || (!sanitized.includes(".") && !sanitized.includes(":"));
+        candidates.push({
+            displayText: trimmedSegment,
+            canonicalName: sanitized,
+            columnStart: startIdx + 1,
+            columnEnd: endIdx + 1,
+            isDirectory,
+        });
+    }
+    return candidates;
+}
+
+function joinPosixPath(base: string, relative: string): string {
+    const baseIsAbsolute = base.startsWith("/");
+    const baseSegments = base.split("/").filter((segment) => segment.length > 0);
+    const relativeSegments = relative.split("/").filter((segment) => segment.length > 0 || segment === "..");
+    const stack = baseSegments.slice();
+
+    for (const segment of relativeSegments) {
+        if (!segment || segment === ".") {
+            continue;
+        }
+        if (segment === "..") {
+            if (stack.length > 0) {
+                stack.pop();
+            }
+            continue;
+        }
+        stack.push(segment);
+    }
+
+    const prefix = baseIsAbsolute ? "/" : "";
+    return prefix + stack.join("/");
+}
+
+function resolvePathRelativeToCwd(rawName: string, cwd: string | null, homeDir: string | null): string {
+    if (!rawName) {
+        return null;
+    }
+    const trimmed = rawName.trim();
+    if (trimmed.length === 0) {
+        return null;
+    }
+    if (trimmed === "~") {
+        if (homeDir) {
+            return homeDir;
+        }
+        return trimmed;
+    }
+    if (trimmed.startsWith("~/")) {
+        if (homeDir) {
+            const suffix = trimmed.slice(2);
+            return homeDir.endsWith("/") ? `${homeDir}${suffix}` : `${homeDir}/${suffix}`;
+        }
+        return trimmed;
+    }
+    if (trimmed.startsWith("/") || isWindowsStylePath(trimmed)) {
+        return trimmed;
+    }
+    if (!cwd || cwd.length === 0) {
+        return trimmed;
+    }
+    let base = cwd;
+    if (base === "~") {
+        base = homeDir ?? base;
+    }
+    if (base?.startsWith("~/")) {
+        const suffix = base.slice(2);
+        if (homeDir?.length > 0) {
+            base = homeDir.endsWith("/") ? `${homeDir}${suffix}` : `${homeDir}/${suffix}`;
+        } else {
+            return joinPosixPath(base, trimmed);
+        }
+    }
+    if (isWindowsStylePath(base)) {
+        const normalizedBase = base.replace(/\\/g, "/");
+        const normalizedRelative = trimmed.replace(/\\/g, "/");
+        const joined = joinPosixPath(normalizedBase, normalizedRelative);
+        return joined.replace(/\//g, "\\");
+    }
+    return joinPosixPath(base, trimmed);
+}
+
+type FileCategory = "directory" | "markdown" | "image" | "code" | "other";
+
+function inferFileCategory(name: string, isDirectory: boolean): FileCategory {
+    if (isDirectory) {
+        return "directory";
+    }
+    if (!name) {
+        return "other";
+    }
+    const lower = name.toLowerCase();
+    const dotIdx = lower.lastIndexOf(".");
+    if (dotIdx <= 0) {
+        return "other";
+    }
+    const ext = lower.slice(dotIdx + 1);
+    if (MarkdownExtensions.has(ext)) {
+        return "markdown";
+    }
+    if (ImageExtensions.has(ext)) {
+        return "image";
+    }
+    if (CodeExtensions.has(ext)) {
+        return "code";
+    }
+    return "other";
+}
 
 // detect webgl support
 function detectWebGLSupport(): boolean {
@@ -153,6 +452,11 @@ function handleOsc7Command(data: string, blockId: string, loaded: boolean): bool
     } catch (e) {
         console.log("Invalid OSC 7 command received (parse error)", data, e);
         return true;
+    }
+
+    const termWrapInstance = termWrapInstances.get(blockId);
+    if (termWrapInstance) {
+        termWrapInstance.lastKnownCwd = pathPart;
     }
 
     setTimeout(() => {
@@ -376,6 +680,7 @@ export class TermWrap {
     // xterm.js paste() method triggers onData event, which can cause duplicate sends
     lastPasteData: string = "";
     lastPasteTime: number = 0;
+    lastKnownCwd: string | null = null;
 
     constructor(
         blockId: string,
@@ -393,6 +698,7 @@ export class TermWrap {
         this.promptMarkers = [];
         this.shellIntegrationStatusAtom = jotai.atom(null) as jotai.PrimitiveAtom<"ready" | "running-command" | null>;
         this.lastCommandAtom = jotai.atom(null) as jotai.PrimitiveAtom<string | null>;
+        termWrapInstances.set(blockId, this);
         this.terminal = new Terminal(options);
         this.fitAddon = new FitAddon();
         this.fitAddon.noScrollbar = PLATFORM === PlatformMacOS;
@@ -418,6 +724,7 @@ export class TermWrap {
                 }
             })
         );
+        this.toDispose.push(this.registerFileLinkProvider());
         if (WebGLSupported && waveOptions.useWebGl) {
             const webglAddon = new WebglAddon();
             this.toDispose.push(
@@ -454,6 +761,106 @@ export class TermWrap {
             dispose: () => {
                 this.connectElem.removeEventListener("paste", pasteHandler, true);
             },
+        });
+    }
+
+    private registerFileLinkProvider(): TermTypes.IDisposable {
+        const provider: TermTypes.ILinkProvider = {
+            provideLinks: (bufferLineNumber, callback) => {
+                const buffer = this.terminal?.buffer?.active;
+                if (!buffer) {
+                    callback(undefined);
+                    return;
+                }
+                const line = buffer.getLine(bufferLineNumber - 1);
+                if (!line) {
+                    callback(undefined);
+                    return;
+                }
+                const lineText = line.translateToString(false);
+                const lineCandidates = extractFileCandidatesFromLine(lineText);
+                if (lineCandidates.length === 0) {
+                    callback(undefined);
+                    return;
+                }
+                const links = lineCandidates.map((candidate) => {
+                    const link: TermTypes.ILink = {
+                        text: candidate.displayText,
+                        range: {
+                            start: { x: candidate.columnStart, y: bufferLineNumber },
+                            end: { x: candidate.columnEnd, y: bufferLineNumber },
+                        },
+                        decorations: {
+                            pointerCursor: true,
+                            underline: true,
+                        },
+                        activate: (event) => {
+                            this.handleFileLinkActivate(event, candidate);
+                            this.terminal.clearSelection();
+                            setTimeout(() => this.terminal.focus(), 0);
+                        },
+                    };
+                    return link;
+                });
+                callback(links);
+            },
+        };
+        return this.terminal.registerLinkProvider(provider);
+    }
+
+    private handleFileLinkActivate(event: MouseEvent, candidate: FileLinkCandidate): void {
+        const modifierPressed = PLATFORM === PlatformMacOS ? event.metaKey : event.ctrlKey;
+        if (!modifierPressed) {
+            return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+
+        const blockAtom = WOS.getWaveObjectAtom(WOS.makeORef("block", this.blockId));
+        const blockData = globalStore.get(blockAtom);
+        const connection = blockData?.meta?.connection ?? null;
+        const metaCwd = blockData?.meta?.["cmd:cwd"] ?? null;
+        const isLocalConnection = connection == null || connection === "" || connection === "local";
+        const homeDir = isLocalConnection ? getApi().getHomeDir() : null;
+        let cwd = metaCwd ?? this.lastKnownCwd;
+        if (!cwd) {
+            const promptPath = this.getPromptDirectory();
+            if (promptPath) {
+                cwd = promptPath;
+                this.lastKnownCwd = promptPath;
+            }
+        }
+        if (!cwd) {
+            cwd = isLocalConnection ? "~" : null;
+        }
+        const resolvedPath = resolvePathRelativeToCwd(candidate.canonicalName, cwd, homeDir);
+        if (!resolvedPath) {
+            console.warn("Unable to resolve path for terminal file link", candidate.canonicalName);
+            return;
+        }
+
+        const category = inferFileCategory(candidate.canonicalName, candidate.isDirectory);
+
+        if (category === "code" && isLocalConnection) {
+            try {
+                getApi().openWithCursor(resolvedPath);
+            } catch (err) {
+                console.error("Failed to open Cursor for file", resolvedPath, err);
+            }
+            return;
+        }
+
+        const blockDef: BlockDef = {
+            meta: {
+                view: "preview",
+                file: resolvedPath,
+            },
+        };
+        if (connection) {
+            blockDef.meta.connection = connection;
+        }
+        fireAndForget(async () => {
+            await createBlock(blockDef);
         });
     }
 
@@ -571,6 +978,27 @@ export class TermWrap {
             } catch (_) {}
         });
         this.mainFileSubject.release();
+        termWrapInstances.delete(this.blockId);
+    }
+
+    private getPromptDirectory(): string | null {
+        const buffer = this.terminal?.buffer?.active;
+        if (!buffer) {
+            return null;
+        }
+        const cursorLine = buffer.baseY + buffer.cursorY;
+        for (let offset = 0; offset < 3; offset++) {
+            const line = buffer.getLine(cursorLine - offset);
+            if (!line) {
+                continue;
+            }
+            const text = line.translateToString(true);
+            const extracted = extractPathFromLine(text);
+            if (extracted) {
+                return extracted;
+            }
+        }
+        return null;
     }
 
     handleTermData(data: string) {

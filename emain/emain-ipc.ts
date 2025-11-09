@@ -13,7 +13,7 @@ import { getWebServerEndpoint } from "../frontend/util/endpoints";
 import * as keyutil from "../frontend/util/keyutil";
 import { fireAndForget, parseDataUrl } from "../frontend/util/util";
 import { createBuilderWindow, getBuilderWindowByWebContentsId } from "./emain-builder";
-import { callWithOriginalXdgCurrentDesktopAsync, unamePlatform } from "./emain-platform";
+import { callWithOriginalXdgCurrentDesktop, callWithOriginalXdgCurrentDesktopAsync, unamePlatform } from "./emain-platform";
 import { getWaveTabViewByWebContentsId } from "./emain-tabview";
 import { handleCtrlShiftState } from "./emain-util";
 import { getWaveVersion } from "./emain-wavesrv";
@@ -22,6 +22,78 @@ import { incrementTermCommandsRun } from "./emain-activity";
 import { ElectronWshClient } from "./emain-wsh";
 
 const electronApp = electron.app;
+
+function expandHomePath(filePath: string): string {
+    if (typeof filePath !== "string" || filePath.length === 0) {
+        return filePath;
+    }
+    if (filePath === "~") {
+        return electronApp.getPath("home");
+    }
+    if (filePath.startsWith("~/")) {
+        return path.join(electronApp.getPath("home"), filePath.slice(2));
+    }
+    return filePath;
+}
+
+function openFileWithCursor(filePath: string) {
+    if (typeof filePath !== "string" || filePath.length === 0) {
+        return;
+    }
+    const expandedPath = expandHomePath(filePath);
+    const fallbackOpen = () => {
+        fireAndForget(() =>
+            callWithOriginalXdgCurrentDesktopAsync(async () => {
+                const excuse = await electron.shell.openPath(expandedPath);
+                if (excuse) {
+                    console.error(`Failed to open ${expandedPath} in native application: ${excuse}`);
+                }
+            })
+        );
+    };
+
+    const platform = process.platform;
+    try {
+        if (platform === "darwin") {
+            const proc = child_process.spawn("/usr/bin/open", ["-a", "Cursor", expandedPath], {
+                detached: true,
+                stdio: "ignore",
+            });
+            proc.on("error", (err) => {
+                console.error("Failed to launch Cursor via open -a:", err);
+                fallbackOpen();
+            });
+            proc.unref();
+            return;
+        }
+
+        if (platform === "win32") {
+            const proc = child_process.spawn("cursor.exe", [expandedPath], {
+                detached: true,
+                stdio: "ignore",
+                windowsHide: true,
+            });
+            proc.on("error", (err) => {
+                console.error("Failed to launch cursor.exe:", err);
+                fallbackOpen();
+            });
+            proc.unref();
+            return;
+        }
+
+        callWithOriginalXdgCurrentDesktop(() => {
+            const proc = child_process.spawn("cursor", [expandedPath], { detached: true, stdio: "ignore" });
+            proc.on("error", (err) => {
+                console.error("Failed to launch cursor CLI:", err);
+                fallbackOpen();
+            });
+            proc.unref();
+        });
+    } catch (err) {
+        console.error("Unexpected error launching Cursor:", err);
+        fallbackOpen();
+    }
+}
 
 let webviewFocusId: number = null;
 let webviewKeys: string[] = [];
@@ -361,6 +433,10 @@ export function initIpcHandlers() {
                 })
             )
         );
+    });
+
+    electron.ipcMain.on("open-with-cursor", (_event, filePath: string) => {
+        openFileWithCursor(filePath);
     });
 
     electron.ipcMain.on("set-window-init-status", (event, status: "ready" | "wave-ready") => {

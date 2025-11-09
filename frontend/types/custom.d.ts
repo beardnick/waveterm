@@ -119,6 +119,7 @@ declare global {
         sendLog: (log: string) => void; // fe-log
         onQuicklook: (filePath: string) => void; // quicklook
         openNativePath(filePath: string): void; // open-native-path
+        openWithCursor(filePath: string): void; // open-with-cursor
         captureScreenshot(rect: Electron.Rectangle): Promise<string>; // capture-screenshot
         setKeyboardChordMode: () => void; // set-keyboard-chord-mode
         clearWebviewStorage: (webContentsId: number) => Promise<void>; // clear-webview-storage
