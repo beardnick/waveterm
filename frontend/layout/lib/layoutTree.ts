@@ -11,6 +11,7 @@ import {
     findParent,
     removeChild,
 } from "./layoutNode";
+import { getRegisteredLayoutNode } from "./layoutNodeRegistry";
 import {
     DefaultNodeSize,
     DropDirection,
@@ -70,7 +71,7 @@ export function computeMoveNode(layoutState: LayoutTreeState, computeInsertActio
 
     // TODO: this should not be necessary. The drag layer is having trouble tracking changes to the LayoutNode fields, so I need to grab the node again here to get the latest data.
     const node = findNode(rootNode, nodeId);
-    const nodeToMove = findNode(rootNode, nodeToMoveId);
+    const nodeToMove = findNode(rootNode, nodeToMoveId) ?? getRegisteredLayoutNode(nodeToMoveId);
 
     if (!node || !nodeToMove) {
         console.warn("node or nodeToMove not set", nodeId, nodeToMoveId);

@@ -19,6 +19,8 @@ import { TermStickers } from "./termsticker";
 import { TermThemeUpdater } from "./termtheme";
 import { computeTheme } from "./termutil";
 import { TermWrap } from "./termwrap";
+import { processVimKey } from "./vimOverlayEngine";
+import { YankRegister } from "./vimOverlayUtils";
 import "./xterm.css";
 
 const dlog = debug("wave:term");
@@ -39,6 +41,12 @@ type TermInputOverlayState = {
     position: { top: number; left: number; contentLeft: number };
     cell: { width: number; height: number; cols: number };
     font: { family?: string; size?: number };
+    mode: "insert" | "normal" | "visualLine";
+    pendingOperator: "d" | "c" | "y" | "g" | null;
+    visualAnchor: number | null;
+    visualSelection: { start: number; end: number } | null;
+    cursor: number;
+    selectionEnd: number;
 };
 
 const TermResyncHandler = React.memo(({ blockId, model }: TerminalViewProps) => {
@@ -191,14 +199,65 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
         position: { top: 0, left: 0, contentLeft: 0 },
         cell: { width: 9, height: 16, cols: 120 },
         font: { family: termFontFamilySetting ?? connFontFamily, size: termFontSize },
+        mode: "insert",
+        pendingOperator: null,
+        visualAnchor: null,
+        visualSelection: null,
+        cursor: 0,
+        selectionEnd: 0,
     });
     const overlayTextareaRef = React.useRef<HTMLTextAreaElement>(null);
     const overlayStateRef = React.useRef<TermInputOverlayState>(overlayState);
     const overlayOriginalInputRef = React.useRef<string>("");
+    const overlayYankRegisterRef = React.useRef<YankRegister>(null);
 
     React.useEffect(() => {
         overlayStateRef.current = overlayState;
     }, [overlayState]);
+
+    const scheduleCursorUpdate = React.useCallback(
+        (position: number, modeOverride?: "insert" | "normal" | "visualLine") => {
+            requestAnimationFrame(() => {
+                const textarea = overlayTextareaRef.current;
+                if (!textarea) {
+                    return;
+                }
+                const value = textarea.value ?? "";
+                const currentState = overlayStateRef.current;
+                const mode = modeOverride ?? currentState.mode ?? "insert";
+                const clampVal = (num: number, min: number, max: number) => Math.min(Math.max(num, min), max);
+                if (mode === "normal") {
+                    textarea.style.caretColor = "transparent";
+                    if (value.length === 0) {
+                        textarea.setSelectionRange(0, 0);
+                        return;
+                    }
+                    let start = clampVal(position, 0, Math.max(0, value.length - 1));
+                    if (start >= value.length) {
+                        start = Math.max(0, value.length - 1);
+                    }
+                    const end = Math.min(value.length, start + 1);
+                    textarea.setSelectionRange(start, end);
+                } else if (mode === "visualLine") {
+                    textarea.style.caretColor = "transparent";
+                    const selection = currentState.visualSelection;
+                    if (selection) {
+                        const start = clampVal(Math.min(selection.start, selection.end), 0, value.length);
+                        const end = clampVal(Math.max(selection.start, selection.end), start, value.length);
+                        textarea.setSelectionRange(start, end);
+                    } else {
+                        const caret = clampVal(position, 0, value.length);
+                        textarea.setSelectionRange(caret, caret);
+                    }
+                } else {
+                    textarea.style.caretColor = "var(--term-foreground)";
+                    const caret = clampVal(position, 0, value.length);
+                    textarea.setSelectionRange(caret, caret);
+                }
+            });
+        },
+        []
+    );
 
     const handleBeforeSendInput = React.useCallback(
         (data: string) => {
@@ -207,23 +266,14 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
         [model]
     );
 
-    const handleInterceptInput = React.useCallback(
-        (data: string) => {
-            if (!overlayStateRef.current.active) {
-                return false;
-            }
-            if (data && data.length > 0) {
-                setOverlayState((prev) => {
-                    if (!prev.active) {
-                        return prev;
-                    }
-                    return { ...prev, value: prev.value + data };
-                });
-            }
-            return true;
-        },
-        []
-    );
+    const handleInterceptInput = React.useCallback((data: string) => {
+        if (!overlayStateRef.current.active) {
+            return false;
+        }
+        // When the overlay is active we fully manage the input within the textarea,
+        // so prevent data from reaching the underlying PTY.
+        return true;
+    }, []);
 
     const updateOverlayPosition = React.useCallback(() => {
         const termWrap = model.termRef.current;
@@ -288,18 +338,23 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
                 position: { top, left, contentLeft },
                 cell: { width: cellWidth, height: cellHeight, cols },
                 font: { family: fontFamily, size: fontSize },
+                mode: "insert",
+                pendingOperator: null,
+                visualAnchor: null,
+                visualSelection: null,
+                cursor: existingValue.length,
+                selectionEnd: existingValue.length,
             });
             requestAnimationFrame(() => {
                 if (overlayTextareaRef.current) {
                     overlayTextareaRef.current.focus();
-                    const length = existingValue.length;
-                    overlayTextareaRef.current.setSelectionRange(length, length);
+                    scheduleCursorUpdate(existingValue.length, "insert");
                 }
             });
             termWrap.terminal.blur?.();
             requestAnimationFrame(() => updateOverlayPosition());
         },
-        [model, termFontFamilySetting, connFontFamily, termFontSize, updateOverlayPosition]
+        [model, termFontFamilySetting, connFontFamily, termFontSize, updateOverlayPosition, scheduleCursorUpdate]
     );
 
     const closeOverlay = React.useCallback(
@@ -311,6 +366,12 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
                 ...prev,
                 active: false,
                 value: "",
+                mode: "insert",
+                pendingOperator: null,
+                visualAnchor: null,
+                visualSelection: null,
+                cursor: 0,
+                selectionEnd: 0,
             }));
             model.setOverlayActive(false);
             if (action === "submit") {
@@ -328,50 +389,97 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
     const handleOverlayChange = React.useCallback(
         (event: React.ChangeEvent<HTMLTextAreaElement>) => {
             const value = event.target.value;
-            setOverlayState((prev) => ({ ...prev, value }));
+            const selectionStart = event.target.selectionStart ?? value.length;
+            const selectionEnd = event.target.selectionEnd ?? selectionStart;
+            setOverlayState((prev) => ({
+                ...prev,
+                value,
+                pendingOperator: null,
+                visualAnchor: null,
+                visualSelection: null,
+                cursor: selectionStart,
+                selectionEnd,
+            }));
             model.setCurrentInputBuffer(value);
-        },
-        [model]
-    );
-
-    const insertOverlayTextAtCursor = React.useCallback(
-        (text: string) => {
-            const textarea = overlayTextareaRef.current;
-            if (!textarea) {
-                return;
-            }
-            const start = textarea.selectionStart ?? 0;
-            const end = textarea.selectionEnd ?? start;
-            const currentValue = textarea.value ?? "";
-            const newValue = currentValue.slice(0, start) + text + currentValue.slice(end);
-            const caret = start + text.length;
-            setOverlayState((prev) => ({ ...prev, value: newValue }));
-            model.setCurrentInputBuffer(newValue);
-            requestAnimationFrame(() => {
-                if (overlayTextareaRef.current) {
-                    overlayTextareaRef.current.setSelectionRange(caret, caret);
-                }
-            });
         },
         [model]
     );
 
     const handleOverlayKeyDown = React.useCallback(
         (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-            if (event.key === "Enter" && event.ctrlKey && !event.altKey && !event.metaKey) {
-                event.preventDefault();
-                insertOverlayTextAtCursor("\n");
+            const textarea = overlayTextareaRef.current;
+            if (!textarea) {
                 return;
             }
-            if (event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
-                event.preventDefault();
+            const selectionStart = textarea.selectionStart ?? 0;
+            const selectionEnd = textarea.selectionEnd ?? selectionStart;
+            const currentState = overlayStateRef.current;
+            const effectiveCursor = currentState.mode === "insert" ? selectionStart : currentState.cursor;
+            const effectiveSelectionEnd = currentState.mode === "insert" ? selectionEnd : currentState.selectionEnd;
+
+            const result = processVimKey(
+                {
+                    value: textarea.value ?? "",
+                    mode: currentState.mode,
+                    pendingOperator: currentState.pendingOperator,
+                    register: overlayYankRegisterRef.current,
+                    visualAnchor: currentState.visualAnchor,
+                    visualSelection: currentState.visualSelection,
+                },
+                effectiveCursor,
+                effectiveSelectionEnd,
+                {
+                    key: event.key,
+                    ctrlKey: event.ctrlKey,
+                    shiftKey: event.shiftKey,
+                    altKey: event.altKey,
+                    metaKey: event.metaKey,
+                }
+            );
+
+            if (!result.handled) {
+                return;
+            }
+
+            event.preventDefault();
+
+            overlayYankRegisterRef.current = result.state.register;
+            const nextOverlayState: TermInputOverlayState = {
+                value: result.state.value,
+                mode: result.state.mode,
+                pendingOperator: result.state.pendingOperator,
+                visualAnchor: result.state.visualAnchor,
+                visualSelection: result.state.visualSelection,
+                active: currentState.active,
+                position: currentState.position,
+                cell: currentState.cell,
+                font: currentState.font,
+                cursor: result.cursor,
+                selectionEnd: result.selectionEnd,
+            };
+            overlayStateRef.current = nextOverlayState;
+            setOverlayState(nextOverlayState);
+            model.setCurrentInputBuffer(result.state.value);
+
+            textarea.value = result.state.value;
+            const displayCursor =
+                result.state.mode === "visualLine" && result.state.visualSelection
+                    ? Math.min(result.state.visualSelection.start, result.state.visualSelection.end)
+                    : result.displayCursor;
+            const displaySelectionEnd =
+                result.state.mode === "visualLine" && result.state.visualSelection
+                    ? Math.max(result.state.visualSelection.start, result.state.visualSelection.end)
+                    : result.displaySelectionEnd;
+            textarea.setSelectionRange(displayCursor, displaySelectionEnd);
+            scheduleCursorUpdate(displayCursor, result.state.mode);
+
+            if (result.action === "submit") {
                 closeOverlay("submit");
-            } else if (event.key === "Escape") {
-                event.preventDefault();
+            } else if (result.action === "cancel") {
                 closeOverlay("cancel");
             }
         },
-        [closeOverlay, insertOverlayTextAtCursor]
+        [closeOverlay, model, scheduleCursorUpdate]
     );
 
     React.useEffect(() => {
@@ -409,6 +517,18 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
         };
     }, [model, overlayState.active, updateOverlayPosition]);
 
+    React.useEffect(() => {
+        if (!overlayState.active) {
+            return;
+        }
+        const textarea = overlayTextareaRef.current;
+        if (!textarea) {
+            return;
+        }
+        const pos = textarea.selectionStart ?? overlayState.value.length;
+        scheduleCursorUpdate(pos, overlayState.mode);
+    }, [overlayState.mode, overlayState.active, overlayState.value.length, scheduleCursorUpdate]);
+
     let overlayStyle: React.CSSProperties | undefined;
     if (overlayState.active) {
         const terminal = model.termRef.current?.terminal;
@@ -425,9 +545,10 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
         const containerRect = container?.getBoundingClientRect();
         const containerWidth = containerRect?.width ?? cellWidth * effectiveCols;
         const containerHeight = containerRect?.height ?? cellHeight * effectiveRows;
-        const maxWidthPx = containerWidth;
-        const desiredWidthPx = containerWidth;
-        const minWidthPx = containerWidth;
+        const contentOffsetLeft = overlayState.position.contentLeft ?? 0;
+        const maxWidthPx = Math.max(containerWidth - contentOffsetLeft, cellWidth * 2);
+        const desiredWidthPx = maxWidthPx;
+        const minWidthPx = Math.min(Math.max(cellWidth * 10, 240), maxWidthPx);
         const widthPx = Math.min(Math.max(desiredWidthPx, minWidthPx), maxWidthPx);
         const paddingAdjustment = 12;
         const minHeightPx = cellHeight + paddingAdjustment;
@@ -440,7 +561,7 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
         }
         overlayStyle = {
             top,
-            left: 0,
+            left: contentOffsetLeft,
             width: widthPx,
             height: heightPx,
             minHeight: minHeightPx,
@@ -452,7 +573,7 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
             paddingTop: basePaddingY,
             paddingBottom: basePaddingY,
             paddingRight: basePaddingX,
-            paddingLeft: (overlayState.position.contentLeft ?? 0) + basePaddingX,
+            paddingLeft: basePaddingX,
         };
     }
 
@@ -654,7 +775,7 @@ const TerminalView = ({ blockId, model }: ViewComponentProps<TermViewModel>) => 
                 {overlayState.active && overlayStyle && (
                     <textarea
                         ref={overlayTextareaRef}
-                        className="term-input-overlay"
+                        className={clsx("term-input-overlay", overlayState.mode === "normal" && "vim-normal")}
                         value={overlayState.value}
                         onChange={handleOverlayChange}
                         onKeyDown={handleOverlayKeyDown}

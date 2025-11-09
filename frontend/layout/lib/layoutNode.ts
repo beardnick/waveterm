@@ -4,6 +4,7 @@
 import { DEFAULT_MAX_CHILDREN } from "./layoutTree";
 import { DefaultNodeSize, FlexDirection, LayoutNode } from "./types";
 import { reverseFlexDirection } from "./utils";
+import { registerLayoutNode } from "./layoutNodeRegistry";
 
 /**
  * Creates a new node.
@@ -30,6 +31,7 @@ export function newLayoutNode(
     if (!validateNode(newNode)) {
         throw new Error("Invalid node");
     }
+    registerLayoutNode(newNode);
     return newNode;
 }
 
@@ -87,6 +89,8 @@ export function addIntermediateNode(node: LayoutNode): LayoutNode {
     const intermediateNodeId = intermediateNode.id;
     intermediateNode.id = node.id;
     node.id = intermediateNodeId;
+    registerLayoutNode(intermediateNode);
+    registerLayoutNode(node);
     return intermediateNode;
 }
 
