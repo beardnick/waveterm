@@ -1,7 +1,31 @@
 // Copyright 2025, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { contextBridge, ipcRenderer, Rectangle, WebviewTag } from "electron";
+import { contextBridge, ipcRenderer, IpcRendererEvent, Rectangle, WebviewTag } from "electron";
+
+type PreloadNeovimStartOptions = {
+    sessionId: string;
+    displayName: string;
+    initialContent: string;
+    cols: number;
+    rows: number;
+};
+
+type PreloadNeovimDataEvent = {
+    sessionId: string;
+    data: string;
+};
+
+type PreloadNeovimExitEvent = {
+    sessionId: string;
+    code?: number;
+    signal?: number;
+};
+
+type PreloadNeovimFileChangeEvent = {
+    sessionId: string;
+    content: string;
+};
 
 // update type in custom.d.ts (ElectronApi type)
 contextBridge.exposeInMainWorld("api", {
@@ -66,6 +90,26 @@ contextBridge.exposeInMainWorld("api", {
     closeBuilderWindow: () => ipcRenderer.send("close-builder-window"),
     incrementTermCommands: () => ipcRenderer.send("increment-term-commands"),
     nativePaste: () => ipcRenderer.send("native-paste"),
+    startNeovimSession: (options: PreloadNeovimStartOptions) => ipcRenderer.invoke("neovim-start", options),
+    sendNeovimInput: (sessionId: string, data: string) => ipcRenderer.send("neovim-input", { sessionId, data }),
+    resizeNeovimSession: (sessionId: string, cols: number, rows: number) =>
+        ipcRenderer.send("neovim-resize", { sessionId, cols, rows }),
+    stopNeovimSession: (sessionId: string) => ipcRenderer.send("neovim-stop", { sessionId }),
+    onNeovimData: (callback: (payload: PreloadNeovimDataEvent) => void) => {
+        const listener = (_event: IpcRendererEvent, payload: PreloadNeovimDataEvent) => callback(payload);
+        ipcRenderer.on("neovim-data", listener);
+        return () => ipcRenderer.off("neovim-data", listener);
+    },
+    onNeovimExit: (callback: (payload: PreloadNeovimExitEvent) => void) => {
+        const listener = (_event: IpcRendererEvent, payload: PreloadNeovimExitEvent) => callback(payload);
+        ipcRenderer.on("neovim-exit", listener);
+        return () => ipcRenderer.off("neovim-exit", listener);
+    },
+    onNeovimFileChange: (callback: (payload: PreloadNeovimFileChangeEvent) => void) => {
+        const listener = (_event: IpcRendererEvent, payload: PreloadNeovimFileChangeEvent) => callback(payload);
+        ipcRenderer.on("neovim-file-change", listener);
+        return () => ipcRenderer.off("neovim-file-change", listener);
+    },
 });
 
 // Custom event for "new-window"

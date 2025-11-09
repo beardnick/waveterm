@@ -4,7 +4,10 @@
 import * as electron from "electron";
 import { FastAverageColor } from "fast-average-color";
 import fs from "fs";
+import type { IPty } from "node-pty";
 import * as child_process from "node:child_process";
+import { createRequire } from "node:module";
+import os from "os";
 import * as path from "path";
 import { PNG } from "pngjs";
 import { Readable } from "stream";
@@ -26,9 +29,76 @@ import { createNewWaveWindow, focusedWaveWindow, getWaveWindowByWebContentsId } 
 import { ElectronWshClient } from "./emain-wsh";
 
 const electronApp = electron.app;
+const requireForMain = createRequire(import.meta.url);
+const nodePtyModule = requireForMain("node-pty") as typeof import("node-pty");
+const { spawn: spawnPty } = nodePtyModule;
 
 let webviewFocusId: number = null;
 let webviewKeys: string[] = [];
+
+type NeovimSession = {
+    pty: IPty;
+    tempFile: string;
+    tempDir: string;
+    watcher: fs.FSWatcher;
+    webContentsId: number;
+    readTimer?: NodeJS.Timeout;
+};
+
+const neovimSessions = new Map<string, NeovimSession>();
+
+function sendToWebContents(webContentsId: number, channel: string, payload: any) {
+    const target = electron.webContents.fromId(webContentsId);
+    if (!target || target.isDestroyed()) {
+        return;
+    }
+    target.send(channel, payload);
+}
+
+async function readFileSafe(filePath: string): Promise<string> {
+    try {
+        const data = await fs.promises.readFile(filePath, "utf8");
+        return data;
+    } catch (err) {
+        console.error("Failed to read Neovim temp file", filePath, err);
+        return null;
+    }
+}
+
+function cleanupNeovimSession(
+    sessionId: string,
+    sendExitEvent = false,
+    exitPayload: { code?: number; signal?: number } = {}
+) {
+    const session = neovimSessions.get(sessionId);
+    if (!session) {
+        return;
+    }
+    if (session.readTimer) {
+        clearTimeout(session.readTimer);
+    }
+    try {
+        session.watcher?.close();
+    } catch (err) {
+        console.warn("Error closing Neovim watcher", err);
+    }
+    try {
+        session.pty?.kill();
+    } catch (err) {
+        console.warn("Error killing Neovim PTY", err);
+    }
+    fs.promises
+        .rm(session.tempDir, { recursive: true, force: true })
+        .catch((err) => console.warn("Error removing Neovim temp dir", session.tempDir, err));
+    neovimSessions.delete(sessionId);
+    if (sendExitEvent) {
+        sendToWebContents(session.webContentsId, "neovim-exit", {
+            sessionId,
+            code: exitPayload.code ?? null,
+            signal: exitPayload.signal ?? null,
+        });
+    }
+}
 
 function expandHomePath(filePath: string): string {
     if (typeof filePath !== "string" || filePath.length === 0) {
@@ -245,6 +315,146 @@ function saveImageFileWithNativeDialog(defaultFileName: string, mimeType: string
 }
 
 export function initIpcHandlers() {
+    electron.ipcMain.handle(
+        "neovim-start",
+        async (
+            event,
+            options: {
+                sessionId: string;
+                displayName: string;
+                initialContent: string;
+                cols: number;
+                rows: number;
+            }
+        ) => {
+            const { sessionId, displayName, initialContent, cols, rows } = options ?? {};
+            if (!sessionId) {
+                throw new Error("neovim-start missing sessionId");
+            }
+            // Clean up any existing session with the same id.
+            cleanupNeovimSession(sessionId);
+
+            const safeNameBase = path.basename(displayName || "") || "buffer";
+            const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "waveterm-nvim-"));
+            const tempFile = path.join(tempDir, safeNameBase);
+            await fs.promises.writeFile(tempFile, initialContent ?? "", "utf8");
+
+            const termCols = Math.max(1, Math.floor(cols ?? 80));
+            const termRows = Math.max(1, Math.floor(rows ?? 24));
+
+            let ptyProcess: IPty;
+            try {
+                ptyProcess = spawnPty("nvim", [tempFile], {
+                    name: "xterm-256color",
+                    cols: termCols,
+                    rows: termRows,
+                    cwd: process.cwd(),
+                    env: {
+                        ...process.env,
+                        TERM: "xterm-256color",
+                    },
+                });
+            } catch (err) {
+                await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+                throw err;
+            }
+
+            const webContentsId = event.sender.id;
+            const session: NeovimSession = {
+                pty: ptyProcess,
+                tempFile,
+                tempDir,
+                watcher: null,
+                webContentsId,
+            };
+
+            const scheduleFileEmit = () => {
+                if (session.readTimer) {
+                    clearTimeout(session.readTimer);
+                }
+                session.readTimer = setTimeout(async () => {
+                    const content = await readFileSafe(tempFile);
+                    if (content != null) {
+                        sendToWebContents(webContentsId, "neovim-file-change", {
+                            sessionId,
+                            content,
+                        });
+                    }
+                }, 75);
+            };
+
+            try {
+                session.watcher = fs.watch(tempFile, { persistent: false }, () => scheduleFileEmit());
+            } catch (err) {
+                cleanupNeovimSession(sessionId);
+                throw err;
+            }
+
+            ptyProcess.onData((data: string) => {
+                sendToWebContents(webContentsId, "neovim-data", { sessionId, data });
+            });
+
+            ptyProcess.onExit((evt) => {
+                cleanupNeovimSession(sessionId);
+                sendToWebContents(webContentsId, "neovim-exit", {
+                    sessionId,
+                    code: evt?.exitCode ?? null,
+                    signal: evt?.signal ?? null,
+                });
+            });
+
+            neovimSessions.set(sessionId, session);
+
+            return { tempFile };
+        }
+    );
+
+    electron.ipcMain.on("neovim-input", (event, payload: { sessionId: string; data: string }) => {
+        const { sessionId, data } = payload ?? {};
+        if (!sessionId || typeof data !== "string") {
+            return;
+        }
+        const session = neovimSessions.get(sessionId);
+        if (!session || session.webContentsId !== event.sender.id) {
+            return;
+        }
+        try {
+            session.pty.write(data);
+        } catch (err) {
+            console.error("Failed to write to Neovim session", sessionId, err);
+        }
+    });
+
+    electron.ipcMain.on("neovim-resize", (event, payload: { sessionId: string; cols: number; rows: number }) => {
+        const { sessionId, cols, rows } = payload ?? {};
+        if (!sessionId) {
+            return;
+        }
+        const session = neovimSessions.get(sessionId);
+        if (!session || session.webContentsId !== event.sender.id) {
+            return;
+        }
+        const termCols = Math.max(1, Math.floor(cols ?? 0));
+        const termRows = Math.max(1, Math.floor(rows ?? 0));
+        try {
+            session.pty.resize(termCols, termRows);
+        } catch (err) {
+            console.warn("Failed to resize Neovim session", sessionId, err);
+        }
+    });
+
+    electron.ipcMain.on("neovim-stop", (event, payload: { sessionId: string }) => {
+        const { sessionId } = payload ?? {};
+        if (!sessionId) {
+            return;
+        }
+        const session = neovimSessions.get(sessionId);
+        if (!session || session.webContentsId !== event.sender.id) {
+            return;
+        }
+        cleanupNeovimSession(sessionId, true);
+    });
+
     electron.ipcMain.on("open-external", (event, url) => {
         if (url && typeof url === "string") {
             fireAndForget(() =>

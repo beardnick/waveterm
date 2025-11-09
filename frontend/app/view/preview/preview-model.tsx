@@ -16,7 +16,6 @@ import { formatRemoteUri } from "@/util/waveutil";
 import clsx from "clsx";
 import { Atom, atom, Getter, PrimitiveAtom, WritableAtom } from "jotai";
 import { loadable } from "jotai/utils";
-import type * as MonacoTypes from "monaco-editor/esm/vs/editor/editor.api";
 import { createRef } from "react";
 import { PreviewView } from "./preview";
 
@@ -156,7 +155,7 @@ export class PreviewModel implements ViewModel {
 
     markdownShowToc: PrimitiveAtom<boolean>;
 
-    monacoRef: React.RefObject<MonacoTypes.editor.IStandaloneCodeEditor>;
+    monacoRef: React.RefObject<{ focus: () => void } | null>;
 
     showHiddenFiles: PrimitiveAtom<boolean>;
     refreshVersion: PrimitiveAtom<number>;
@@ -651,9 +650,37 @@ export class PreviewModel implements ViewModel {
     }
 
     async handleFileRevert() {
-        const fileContent = await globalStore.get(this.fileContent);
-        this.monacoRef.current?.setValue(fileContent);
-        globalStore.set(this.newFileContent, null);
+        // Revert is handled directly within Neovim (e.g., :e!)
+    }
+
+    async handleNeovimFileWrite(updatedContent: string) {
+        if (updatedContent == null) {
+            return;
+        }
+        const currentSaved = globalStore.get(this.fileContentSaved);
+        if (currentSaved === updatedContent) {
+            return;
+        }
+        const filePath = await globalStore.get(this.statFilePath);
+        if (filePath == null) {
+            return;
+        }
+        try {
+            await RpcApi.FileWriteCommand(TabRpcClient, {
+                info: {
+                    path: await this.formatRemoteUri(filePath, globalStore.get),
+                },
+                data64: stringToBase64(updatedContent),
+            });
+            globalStore.set(this.fileContent, updatedContent);
+            globalStore.set(this.newFileContent, null);
+        } catch (e) {
+            const errorStatus: ErrorMsg = {
+                status: "Save Failed",
+                text: `${e}`,
+            };
+            globalStore.set(this.errorMsgAtom, errorStatus);
+        }
     }
 
     async handleOpenFile(filePath: string) {

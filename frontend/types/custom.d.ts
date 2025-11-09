@@ -127,6 +127,13 @@ declare global {
         closeBuilderWindow: () => void; // close-builder-window
         incrementTermCommands: () => void; // increment-term-commands
         nativePaste: () => void; // native-paste
+        startNeovimSession: (options: NeovimStartOptions) => Promise<{ tempFile: string }>; // neovim-start
+        sendNeovimInput: (sessionId: string, data: string) => void; // neovim-input
+        resizeNeovimSession: (sessionId: string, cols: number, rows: number) => void; // neovim-resize
+        stopNeovimSession: (sessionId: string) => void; // neovim-stop
+        onNeovimData: (callback: (payload: NeovimDataEvent) => void) => () => void; // neovim-data
+        onNeovimExit: (callback: (payload: NeovimExitEvent) => void) => () => void; // neovim-exit
+        onNeovimFileChange: (callback: (payload: NeovimFileChangeEvent) => void) => () => void; // neovim-file-change
     };
 
     type ElectronContextMenuItem = {
@@ -492,6 +499,30 @@ declare global {
               size?: number;
               previewurl?: string;
           };
+
+    type NeovimStartOptions = {
+        sessionId: string;
+        displayName: string;
+        initialContent: string;
+        cols: number;
+        rows: number;
+    };
+
+    type NeovimDataEvent = {
+        sessionId: string;
+        data: string;
+    };
+
+    type NeovimExitEvent = {
+        sessionId: string;
+        code?: number;
+        signal?: number;
+    };
+
+    type NeovimFileChangeEvent = {
+        sessionId: string;
+        content: string;
+    };
 }
 
 export {};
